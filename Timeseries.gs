@@ -77,7 +77,7 @@ Timeseries.prototype.fromSheet = function(name, metadata, keyspec, datespec, typ
   
   var sheet = active_app.getSheetByName(name);
   var headers = sheet.getRange(1, 1, this.headersLen(), sheet.getLastColumn()).getValues();
-  var values = sheet.getRange(this.headersLen() + 1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues(); 
+  var values = sheet.getRange(this.headersLen() + 1, 1, sheet.getLastRow() - this.headersLen(), sheet.getLastColumn()).getValues(); 
     
   this.sheet = name;
   this.metadata = metadata;
