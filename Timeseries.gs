@@ -4,13 +4,11 @@
  *  in header rows at the top of the first column in the group.
  *  
  *  Rows represent the actual timeseries data with the date stored as the
- *  first column in each row (when using "ROW" format).
+ *  first column in each row.
  * 
- *  Timeseries can also use "COLUMN" date spec which stores a separate date
- *  with each group of columns.  This is useful for sparse data when column
- *  group does not have data for every date in the range.
- *
- *  Timeseries currently only support intervals of 1 day.
+ *  Timeseries data is assumed to be non-sparse, ie. a value exists for every
+ *  column group for every time interval.  Timeseries currently only support 
+ *  intervals of 1 day.
  * 
  *  Metadata rows are assumed to be in the order:
  *    <Column Group Type>
@@ -22,7 +20,7 @@
  *    ...
  */
 
-/** Construct a new timeseries.
+/** Construct a new Timeseries.
  * 
  *  sheet: The name of the sheet that the Timeseries serializes from / to.
  *  metadata: Spec describing the metadata rows stored at the top of each
@@ -30,10 +28,6 @@
  *  keyspec: Spec describing the key matadata stored at the top of each
  *    group of columns in the form { <KEY_FIELD_NAME>: <ROW NUMBER>, ...}.
  *    The compound key for each column group must be unique in the sheet.
- *  datespec: Spec describing how dates are represented in the sheet. 
- *    Either "ROW" indicating that a single date is stored for each row,
- *    or "COLUMN" indicating that a date column is stored along with each
- *    group of columns.
  *  typespec: Spec describing the types of the column groups used in the
  *    Timeseries of the form:
  *      {
@@ -43,65 +37,118 @@
  *        },
  *        ...
  *      }
- *  columns: Data for each column group in the form:
- *      {
- *        <KEY_VALUE>: {
- *          metadata: { <FIELD_NAME>: <FIELD_VALUE>, ... },
- *          type: <column group type>,
- *          column: <zero based column group index>,
- *        },
- *        ...
- *      }
- *  values: Data stored in the Timeseries.
- *  start_date: start_date indicates the date corresponding to the first
+ *  start: start indicates the date corresponding to the first
  *    row of data.
  */
 
 var TYPE_ROW = 0;
 var DEFAULT_HEADERS_LENGTH = 1;
 
-function Timeseries(sheet, metadata, keyspec, datespec, typespec, columns, values, start_date) {
+function Timeseries(sheet, metadata, keyspec, typespec, start) {
   this.sheet = sheet;
   this.metadata = metadata;
   this.keyspec = keyspec;
-  this.datespec = datespec;
   this.typespec = typespec;
-  this.columns = columns;
-  this.values = values;
-  this.start_date = start_date;
+  this.startDate = start;
+  this.columns = {};
+  this.values = [];
+  this.sheetColumnMap = {};
+  this.serializedLen = 0;
+
+  if (this.startDate !== undefined) {
+    this.startDate.setHours(0,0,0,0);  
+  }
 }
 
 /** Deserialize the specified sheet into a Timeseries object. */
-Timeseries.prototype.fromSheet = function(name, metadata, keyspec, datespec, typespec) {
+Timeseries.prototype.fromSheet = function(name, metadata, keyspec, typespec) {
   var active_app = SpreadsheetApp.getActiveSpreadsheet();
   
   var sheet = active_app.getSheetByName(name);
-  var headers = sheet.getRange(1, 1, this.headersLen(), sheet.getLastColumn()).getValues();
-  var values = sheet.getRange(this.headersLen() + 1, 1, sheet.getLastRow() - this.headersLen(), sheet.getLastColumn()).getValues(); 
-    
-  this.sheet = name;
-  this.metadata = metadata;
-  this.keyspec = keyspec;
-  this.datespec = datespec;
-  this.typespec = typespec;
-  
-  this.columnGroupsFromHeaders(headers);
-  this.startDateFromValues(values);
-  
-  var trimmed = values;
-  if (datespec == "ROW") {
-    trimmed = [];
-    for (var i = 0; i < values.length; i++) {
-      var row = [];
-      for (var j = 1; j < values[i].length; j++) {
-        row.push(values[i][j]);
-      }
-      trimmed.push(row);
-    }   
+  if (sheet == null) {
+    throw new Error("Uknown sheet: " + name);
   }
-  this.values = trimmed;
-  
+
+  Timeseries.call(this, sheet, metadata, keyspec, typespec);
+
+  var read = this.readHeadersAndValues(sheet);
+  this.startDate = this.startDateFromValues(read.values);
+  this.serializedLen = read.rows;
+  this.columnGroupsFromHeaders(read.headers);
+  this.setValues(read.values);
   return this;
+}
+
+/** Deserialize the metadata from the specified sheet into a Timeseries object. */
+Timeseries.prototype.metadataFromSheet = function(name, metadata, keyspec, typespec) {
+  var active_app = SpreadsheetApp.getActiveSpreadsheet();
+  
+  var sheet = active_app.getSheetByName(name);
+  if (sheet == null) {
+    throw new Error("Uknown sheet: " + name);
+  }
+
+  Timeseries.call(this, sheet, metadata, keyspec, typespec);
+
+  var read = this.readHeaders(sheet);
+  this.startDate = this.startDateFromValues(this.readDateValues(sheet, read.columns));
+  this.serializedLen = read.rows;
+  this.columnGroupsFromHeaders(read.headers);
+  return this;
+}
+
+Timeseries.prototype.readHeaders = function(sheet) {
+  var lastColumn = sheet.getLastColumn();
+  var lastRow = sheet.getLastRow();
+  var headers = [];
+  var rows = 0;
+
+  for (var i = 0; i < this.headersLen(); i++) {
+    headers.push([]);
+  }
+
+  if (lastColumn > 0) {
+    rows = lastRow - this.headersLen();
+    headers = sheet.getRange(1, 1, this.headersLen(), lastColumn).getValues();
+  }
+
+  return {headers: headers, rows: rows, columns: lastColumn};
+}
+
+Timeseries.prototype.readHeadersAndValues = function (sheet) {
+    var read = this.readHeaders(sheet);
+
+    if (read.rows > 0) {
+      read.values = sheet.getRange(this.headersLen() + 1, 1, read.rows, read.columns).getValues();
+    } else {
+      read.values = [];
+    }
+
+    return read;
+}
+
+Timeseries.prototype.readDateValues = function(sheet, columns) {
+  return sheet.getRange(this.headersLen() + 1, 1, 1, 1).getValues();
+}
+
+Timeseries.prototype.fromHeadersAndValues = function(headers, values) {
+  this.startDate = this.startDateFromValues(values);
+  this.serializedLen = values.length;
+  this.columnGroupsFromHeaders(headers);
+  this.setValues(values);
+  return this;
+}
+
+Timeseries.prototype.setValues = function(values) {
+  var trimmed = [];
+  for (var i = 0; i < values.length; i++) {
+    var row = [];
+    for (var j = 1; j < values[i].length; j++) {
+      row.push(values[i][j]);
+    }
+    trimmed.push(row);
+  }   
+  this.values = trimmed;
 }
 
 /** Returns all of the column group keys defined in the Timeseries. */
@@ -109,23 +156,48 @@ Timeseries.prototype.keys = function() {
   return Object.keys(this.columns);
 }
 
-/** Returns the width in columns of the Timeseries. */
+Timeseries.prototype.start = function() {
+  return new Date(this.startDate);
+}
+
+Timeseries.prototype.setStart = function(start) {
+  this.startDate = new Date(start);
+  this.startDate.setHours(0,0,0,0);
+}
+
+Timeseries.prototype.end = function() {
+  if (this.startDate !== undefined) {
+    var end = new Date(this.startDate);
+    end.setDate(end.getDate() + this.values.length);
+    return end;
+  } else {
+    return undefined;
+  }
+}
+
+/** Returns the width in columns of the Timeseries.
+ *  Ignores the date column.
+ */
 Timeseries.prototype.width = function() {
-  var result = (this.datespec == "ROW" ? 1 : 0);
-  var dateOffset = (this.datespec == "ROW" ? 0 : 1);
+  // Ignore the date column
+  var result = 0;
   
   var keys = this.keys();
   for (var i = 0; i < keys.length; i++) {
     var type = this.type(keys[i]);
-    result += this.stride(type) + dateOffset;
+    result += this.stride(type);
   }
   
   return result;
 }
 
+/** Returns the serialized offset for the column groups. */
+Timeseries.prototype.serializedColumnOffset = function() {
+  return 1;
+}
+
 /** Adds a column group to this Timeseries. */
 Timeseries.prototype.addColumnGroup = function(key, type, metadata) {  
-  var dateOffset = (this.datespec == "ROW" ? 0 : 1);
   var idx = this.width();
   
   this.columns[key] = {
@@ -133,10 +205,28 @@ Timeseries.prototype.addColumnGroup = function(key, type, metadata) {
     metadata: metadata,
     column: idx
   };
-  
+
+  this.initColumnValues(this.columnWidth(key));
+}
+
+/** Merges a column group into this Timeseries. */
+Timeseries.prototype.copyColumnGroup = function(key, c) {
+  var metadata = {};
+  var mIds = Object.keys(c.metadata);
+  for (var i = 0; i < mIds.length; i++) {
+    metadata[mIds[i]] = c.metadata[mIds[i]];
+  }
+
+  this.addColumnGroup(key, c.type, metadata);
+}
+
+/** Adds the specified number of columns to the values of this 
+ *  Timeseries. 
+ */
+Timeseries.prototype.initColumnValues = function(width) {  
   if (this.values.length > 0) {
     for (var i = 0; i < this.values.length; i++) {
-      for (var j = 0; j < this.stride(type) + dateOffset; j++) {
+      for (var j = 0; j < width; j++) {
         this.values[i].push("");
       }
     }
@@ -201,14 +291,42 @@ Timeseries.prototype.getMetadata = function(key, mId) {
   return this.columns[key].metadata[mId];
 }
 
+/** Returns a map of the key for each column group to the specified 
+ *  metadata.
+ */
+Timeseries.prototype.metadataMap = function(mId) {
+  var result = {};
+  var keys = this.keys();
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    result[key] = this.getMetadata(key, mId);
+  }
+
+  return result;
+}
+
 /** Returns the number of rows in the Timeseries. */
 Timeseries.prototype.length = function() {
   return this.values.length;
 }
 
+/** Returns the serialized length of the Timeseries,
+ *  as determined when the Timeseries was most recently
+ *  read or written.
+ */
+Timeseries.prototype.serializedLength = function() {
+  return this.serializedLen;
+}
+
 /** Returns the number of rows in the Timeseries headers. */
 Timeseries.prototype.headersLen = function() {
-  return 1 + Object.keys(this.metadata).length + Object.keys(this.keyspec).length;
+  return DEFAULT_HEADERS_LENGTH + Object.keys(this.metadata).length + Object.keys(this.keyspec).length;
+}
+
+/** Returns the width of a column group. */
+Timeseries.prototype.columnWidth = function(key) {
+  return this.stride(this.type(key));
 }
 
 /** Returns the stride size of the column group. */
@@ -230,30 +348,23 @@ Timeseries.prototype.validType = function(type) {
 /** Returns the column index for the specified column within the column group
  *  corresponding to key.
  *
- *  Note: Column group index ignores the initial date column if using
- *    the "ROW" datespec.  Add one to account for the date column, if using
- *    this to calculate the column index for the sheet.
+ *  Note: Column group index ignores the initial date column when serialized.
+ *    Add one to account for the date column, if using this to calculate the
+ *    column index for the sheet.
  */
 Timeseries.prototype.column = function(key, column) {
-  var dateOffset = 0;
-  if (this.datespec == "COLUMN") {
-    dateOffset = 1;
-  }
-  
   if (!(key in this.columns)) {
     throw new Error("failed to retrieve column index for unknown column group: " + key);
   }
   
-  if (column === undefined || column == "date") {
-    if (column == "date" && this.datespec == "ROW") {
-      throw new Error("failed to access date field on ROW date instance");
-    }
-    
-    return this.columns[key].column;
+  var type = this.columns[key].type;
+  var result = this.columns[key].column;
+
+  if (column !== undefined) {
+    result += this.validType(type)[column];
   }
   
-  var type = this.columns[key].type;
-  return this.columns[key].column + this.validType(type)[column] + dateOffset;
+  return result;
 }
 
 /** Returns the data for the specified row, column group and column. */
@@ -265,30 +376,47 @@ Timeseries.prototype.get = function(row, key, column) {
 }
 
 /** Returns the row date for the specified row. */
-Timeseries.prototype.getRowDate = function(row) {
-  if (this.datespec == "COLUMN") {
-    throw new Error("failed to access row date on COLUMN date instance");
-  }
-  
-  var result = new Date(this.start_date);
+Timeseries.prototype.getRowDate = function(row) {  
+  var result = new Date(this.start());
   result.setDate(result.getDate() + row);
-  
+
   return result;
 }
 
-/** Returns the sheet column identifier for the specified column. */
-Timeseries.prototype.sheetColumn = function(key, column) {
-  var result = "";
-  var offset = 0;
-  
-  if (this.datespec == "ROW") {
-    offset = 1;
+/** Returns the sheet column identifier for the specified column. 
+ *  Assumes the specified column is zero based.
+ */
+Timeseries.prototype.sheetColumn = function(key, column) { 
+  var sheetCol = this.column(key, column) + 1;
+  return this.sheetColumnOrdinal(sheetCol);
+}
+
+/** Returns a map of key to sheet and column identifier. */
+Timeseries.prototype.getSheetColumnMap = function() {
+  if (Object.keys(this.sheetColumnMap).length == 0) {
+    var keys = this.keys();
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var type = this.type(key);
+      var typeColumns = Object.keys(this.validType(type));
+      var typeColumnMap = {};
+
+      for (var j = 0; j < typeColumns.length; j++) {
+        typeColumnMap[typeColumns[j]] = "'" + this.sheet.getSheetName() + "'!" + this.sheetColumn(key, typeColumns[j]);
+      }
+
+      this.sheetColumnMap[key] = typeColumnMap;
+    }
   }
-  
-  var sheetCol = this.column(key, column) + offset;
-  
-  var first = Math.floor(sheetCol / 26);
-  var second = sheetCol % 26;
+
+  return this.sheetColumnMap;
+}
+
+/** Returns the sheet column identifier for the specified column ordinal. */
+Timeseries.prototype.sheetColumnOrdinal = function(ord) {  
+  var first = Math.floor(ord / 26);
+  var second = ord % 26;
+  var result = "";
   
   if (first > 0) {
     result = result + String.fromCharCode(64 + first);
@@ -299,161 +427,105 @@ Timeseries.prototype.sheetColumn = function(key, column) {
   return result;
 }
 
-Timeseries.prototype.sanitizeDate = function(date) {
-  return new Date(date).setHours(0,0,0,0);
+/** Checks that the supplied Timeseries contains the same column keys
+ *  as this Timeseries and that the column indices match.
+ */
+Timeseries.prototype.validateColumnEqual = function (ts) {
+  var keysA = this.keys();
+  var keysB = ts.keys();
+  if (keysA.length != keysB.length) {
+    throw new Error("Timeseries contain a different number of columns");
+  }
+
+  for (var i = 0; i < keysA.length; i++) {
+    var keyA = keysA[i];
+
+    if (!ts.hasKey(keyA)) {
+      throw new Error("Timeseries does not contain key: " + keyA);
+    }
+
+    if (ts.column(keyA) != this.column(keyA)) {
+      throw new Error("Column indices differ for key: " + keyA);
+    }
+  }
 }
 
-/** Converts the Timeseries to the ROW date spec. */
-Timeseries.prototype.toRowSpec = function(start_date, end_date) {
-  if (this.datespec == "ROW") {
-    throw new Error("failed to convert Timeseries already in ROW format");
-  }
-  
-  var result = [];
-  var counters = {};
-  
-  // Initialise row counters to 0
-  var keys = this.keys();
-  for (var i = 0; i < keys.length; i++) {
-    counters[keys[i]] = 0;
-  }
-    
-  // For each day in the range
-  var end = new Date(end_date);
-  for (var d = new Date(start_date); d < end; d.setDate(d.getDate() + 1)) {
-    var row = [];
+/** Validate that the supplied Timeseries covers a time period
+ *  that begins the day after the current Timeseries period ends.
+ */
+Timeseries.prototype.validateAdjacent = function(ts) {
+    var appendDate = this.end();
 
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      var type = this.type(key);
-      
-      // Check if the current day is greater than the next value
-      // available for the column group
-      while (counters[key] + 1 < this.length() &&
-             d >= this.sanitizeDate(this.get(counters[key] + 1, key, "date"))) {
-        // Increment the row counter for the column group
-        counters[key]++;
-      }
-      
-      // Append the current column group values to the row
-      var column = this.columns[key].column;
-      for (var j = 0; j < this.validType(type).stride; j++) {
-        row.push(this.values[counters[key]][column + j + 1]);
-      }
+    if (ts.start().getTime() != appendDate.getTime()) {
+      throw new Error("Timeseries time period is not adjacent");
     }
-    
-    result.push(row);
-  }
-  
-  this.values = result;
-  this.start_date = start_date;
-  this.datespec = "ROW";
 }
 
 /** Merges the supplied Timeseries into the current one.
- *  Assumes all supplied Timeseries are in ROW format and use common
- *. metadata, keyspec and typespec.
+ *  Assumes all supplied Timeseries use common metadata, keyspec and typespec.
  */
 Timeseries.prototype.merge = function(...cs) {
-  if (this.datespec != "ROW") {
-    throw new Error("failed to merge Timeseries not in ROW format");
-  }
-  
   for (var i = 0; i < cs.length; i++) {
-    if (cs[i].datespec != "ROW") {
-      throw new Error("failed to merge Timeseries not in ROW format");
-    }
-    
-    if (cs[i].start_date != this.start_date) {
-      throw new Error("failed to merge Timeseries with different start dates.");
-    }
-    
-    if (cs[i].values.length != this.values.length) {
-      throw new Error("failed to merge Timeseries with different end dates.");
+    if (this.length() == 0) {
+      // Merging into an empty timeseries
+      this.startDate = new Date(cs[i].start());
+      for (var j = 0; j < cs[i].length(); j++) {
+        this.values.push([]);
+      }
+    } else {
+      // Merging into an existing timeseries
+      if (cs[i].startDate.getTime() != this.startDate.getTime()) {
+        throw new Error("failed to merge Timeseries with different start dates.");
+      }
+      
+      if (cs[i].values.length != this.values.length) {
+        throw new Error("failed to merge Timeseries with different end dates: " + cs[i].values.length + ", " + this.values.length);
+      }
     }
     
     var keys = cs[i].keys();
     for (var j = 0; j < keys.length; j++) {
       var key = keys[j];
       
-      if (key in this.columns) {
-        throw new Error("failed to merge Timeseries that contains duplicate key: " + key);
+      if (!(key in this.columns)) {
+        this.copyColumnGroup(key, cs[i].columns[key]);
       }
-      
-      this.columns[key] = cs[i].columns[key];
     }
     
-    for (var j = 0; j < this.values.length; j++) {
-      for (var k = 0; k < cs[i].values[j].length; k++) {
-        this.values[j].push(cs[i].values[j][k]);
+    var mergedKeys = cs[i].keys();
+    for (var j = 0; j < mergedKeys.length; j++) {
+      for (var k = 0; k < this.values.length; k++) {
+        var key = mergedKeys[j];
+        var stride = this.columnWidth(key);
+        var dest = this.column(key);
+        var src = cs[i].column(key);
+
+        for (var l = 0; l < stride; l++) {
+          this.values[k][dest + l] = cs[i].values[k][src + l];
+        }
       }
-    }
+    }   
   }
 }
 
-/** Inserts values to a column group in a sparse COLUMN spec Timeseries.
- *  
- *  ROW spec Timeseries are not supported since it does not make sense to append
- *  a single column group in a fully materialized Timeseries.
+/** Appends the values of a Timeseries to the current one.
+ *  Assumes all supplied Timeseries use common metadata, keyspec and typespec.
+ *  Assumes that the date range of the supplied timeseries are adjacent to the
+ *  this Timeseries and that they are provided in date range order.
  */
-Timeseries.prototype.insertAtDate = function(key, date, values) {
-  var column = this.column(key);
-  var type = this.type(key);
-  var stride = this.stride(type);
-  var lastRow = this.length() - 1;
-  
-  if (lastRow < 0) {
-    // Timeseries currently contains no values.
-    // Create a row and add the values to it.
-    this.appendEmptyRow();
-    this.insertAtRow(key, 0, values, date);
-  } else {
-    var insertRow = this.findRowForDate(key, date);
-    
-    if (insertRow < 0) {
-      // All rows in the Timeseries are filled for the column group key and
-      // they are all before the supplied date.
-      // Create a row and add the values to it.
-      this.appendEmptyRow();
-      this.insertAtRow(key, lastRow + 1, values, date);
-    } else {
-      // The row to insert at exists within the Timeseries.
-      var rowDate = this.get(insertRow, key, "date");
-    
-      if (rowDate == "") {
-        // The insertion row is blank.
-        // Insert the values.
-        this.insertAtRow(key, insertRow, values, date);
-      } else if (rowDate.getTime() > date.getTime()) {
-        // The Timeseries contains dates after the supplied date.
-        // Move all greater dates to make space for the inserted data.
-        var lastDate = this.get(lastRow, key, "date");
-        
-        if (lastDate != "") {
-          // This column group extends to the limit of the Timeseries.
-          // Create a row to shuffle data into.
-          this.appendEmptyRow();
-          lastRow++;
-        }
-        
-        // Copy each row from the previous row in the range lastRow to 
-        // insertRow.
-        for (var i = lastRow; i > insertRow; i--) {
-          for (var j = 0; j < stride + 1; j++) {
-            this.values[i][column + j] = this.values[i - 1][column + j];
-          }
-        }
-        
-        // Insert the new row.
-        this.insertAtRow(key, insertRow, values, date);
-      } else if (rowDate.getTime() == date.getTime()) {
-        // The Timeseries contains values for the supplied date
-        this.insertAtRow(key, insertRow, values, date);
-      } else {
-        // Searching the Timeseries returned a date before the supplied date.
-        // This should not happen and likely means that the dates weren't sorted.
-        throw new Error("Found row["+insertRow+"] with date before insertion date.  Are the dates correctly sorted?");
+Timeseries.prototype.append = function(...ts) {
+  for (var i = 0; i < ts.length; i++) {
+    this.validateColumnEqual(ts[i]);
+    this.validateAdjacent(ts[i]);
+
+    for (var j = 0; j < ts[i].values.length; j++) {
+      var row = [];
+
+      for (var k = 0; k < ts[i].values[j].length; k++) {
+        row.push(ts[i].values[j][k]);
       }
+
+      this.values.push(row);
     }
   }
 }
@@ -471,86 +543,34 @@ Timeseries.prototype.compareDates = function(first, second) {
     return 1;
   } else if (second == "") {
     return -1;
+  } else if (!(first instanceof Date)) {
+    throw new Error("First operand is not a date: " + first);
+  } else if (!(second instanceof Date)) {
+    throw new Error("Second operand is not a date: " + second);
   } else {
     return (first.getTime()>second.getTime())-(first.getTime()<second.getTime());
   }
 }
 
-/** Finds the first row containing a date after the supplied date, or the first
- *  empty row for the given column group.  Assumes the Timeseries is in sparse 
- *  COLUMN spec format.  Assumes the dates are sorted.
- */
-Timeseries.prototype.findRowForDate = function(key, date) {
-  if (this.datespec != "COLUMN") {
-    throw new Error("Unimplemented: findRowForDate not implemented for ROW spec Timeseries.");
-  }
-  
-  var startIdx = 0;
-  var endIdx = this.length() - 1;
-  var column = this.column(key);
-  
-  while(startIdx <= endIdx) {
-    var middleIdx = Math.floor((startIdx + endIdx) / 2);
-    
-    if((middleIdx == 0 || this.compareDates(date, this.values[middleIdx - 1][column])) > 0 &&
-       this.compareDates(date, this.values[middleIdx][column]) <= 0) {
-      return middleIdx;
-    }
-    
-    if(this.compareDates(date, this.values[middleIdx][column]) > 0) {
-      startIdx = middleIdx + 1;
-      continue;
-    }
-    
-    if(this.compareDates(date, this.values[middleIdx - 1][column]) <= 0) {
-      endIdx = middleIdx - 1;
-      continue;
-    }
-  }
-  
-  return -1
-}  
-
 /** Appends an empty row to the values for this Timeseries. */
 Timeseries.prototype.appendEmptyRow = function() {
-  var keys = this.keys();
   var row = [];
-  
-  if (this.datespec == "ROW") {
+
+  for (var i = 0; i < this.width(); i++) {
     row.push("");
-  }
-  
-  for (var i = 0; i < keys.length; i++) {
-    var stride = this.stride(this.type(keys[i]));
-    
-    if (this.datespec == "COLUMN") {
-      row.push("");
-    }
-    
-    for (var j = 0; j < stride; j++) {
-      row.push("");
-    }
   }
   
   this.values.push(row);
 }
 
 /** Inserts the supplied values for the specified column group at the specified row. 
- *  
- *  date will be prepended to the values if using a sparse COLUMN spec timeseries,
- *    otherwise it will be ignored.
  */
-Timeseries.prototype.insertAtRow = function(key, row, values, date) {
+Timeseries.prototype.insertAtRow = function(key, row, values) {
   if (this.length() <= row) {
     throw new Error("failed to insert at row ["+row+"]: length is: "+this.length());
   }
   
   var column = this.column(key);
-  
-  if (this.datespec == "COLUMN") {
-    this.values[row][column] = date;
-    column++;
-  }
   
   for (var i = 0; i < values.length; i++) {
     this.values[row][column + i] = values[i];
@@ -561,12 +581,8 @@ Timeseries.prototype.insertAtRow = function(key, row, values, date) {
 Timeseries.prototype.getDateRange = function() {
   var result = [];
   
-  if (this.datespec != "ROW") {
-    throw new Error("failed to get date range for Timeseries not in ROW format.");
-  }
-  
   for (var i = 0; i < this.values.length; i++) {
-    var d = new Date(this.start_date)
+    var d = new Date(this.startDate)
     d.setDate(d.getDate() + i);
     result.push([d]);
   }
@@ -576,56 +592,60 @@ Timeseries.prototype.getDateRange = function() {
 
 /** Serializes the Timeseries to a specified sheet. */
 Timeseries.prototype.toSheet = function(name) {
-  var active_app = SpreadsheetApp.getActiveSpreadsheet();
-  
-  var sheet = active_app.getSheetByName(name);
+  var sheet = this.sheet;
+
+  if (name !== undefined) {
+    var active_app = SpreadsheetApp.getActiveSpreadsheet();
+    sheet = active_app.getSheetByName(name);
+    this.sheet = sheet;
+  }
+
+  sheet.clear();
+
+  var d = this.getDateRange();
 
   var headers = this.writeHeaders();
-  
   if (headers.length == 0 || headers[0].length == 0) {
     throw new Error("failed to serialize Timeseries["+this.sheet+"]: no headers were generated");
   }
   
-  if (this.values.length == 0 || this.values[0].length == 0) {
-      throw new Error("failed to serialize Timeseries["+this.sheet+"]: no values found");
-  }  
-    
   sheet.getRange(1, 1, headers.length, headers[0].length).setValues(headers);
-  
-  var dateOffset = 0;
-  if (this.datespec == "ROW") {
-    var d = this.getDateRange();
+
+  if (this.values.length > 0 && this.values[0].length > 0) {
     sheet.getRange(headers.length + 1, 1, d.length, 1).setValues(d);
-    dateOffset = 1;
+    sheet.getRange(headers.length + 1, 2 /* Date offset */, this.values.length, this.values[0].length).setValues(this.values);
   }
-  
-  sheet.getRange(headers.length + 1, 1 + dateOffset, this.values.length, this.values[0].length).setValues(this.values);
+
+  this.serializedLen = this.values.length;  
 }
 
 /** Serializes headers to a two dimensional array. */
-Timeseries.prototype.writeHeaders = function() {  
+Timeseries.prototype.writeHeaders = function() { 
+  var result = this.writeColumnGroupHeaders();
+  var headersLen =  this.headersLen(); 
+
+  for (var i = 0; i < headersLen; i++) {
+    if (i == headersLen - 1) {
+      result[i].unshift("Date");
+    } else {
+      result[i].unshift("");
+    }
+  }
+
+  return result;
+}
+
+/** Serializes headers to a two dimensional array. */
+Timeseries.prototype.writeColumnGroupHeaders = function() {  
   var result = [];
   
   var metadataRows = Object.keys(this.metadata);
   var keyRows = Object.keys(this.keyspec);
-  var headersLen = metadataRows.length + keyRows.length + 1;  
+  var headersLen =  this.headersLen(); 
   for (var i = 0; i < headersLen; i++) {
     result.push([]);
   }
-  
-  var dateStride = 1;
-  if (this.datespec == "ROW") {
-    for (var i = 0; i < headersLen; i++) {
-      if (i == headersLen - 1) {
-        result[i].push("Date");
-      } else {
-        result[i].push("");
-      }
-    }
-    
-    dateStride = 0;
-  }
-  
+
   var keys = this.keys();
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
@@ -635,7 +655,7 @@ Timeseries.prototype.writeHeaders = function() {
     result[0].push(type);
     
     // Add any padding columns needed by the column group type
-    for (var j = 0; j < this.validType(type).stride + dateStride - 1; j++) {
+    for (var j = 0; j < this.columnWidth(key) - 1; j++) {
       result[0].push("");
     }
   }
@@ -651,7 +671,7 @@ Timeseries.prototype.writeHeaders = function() {
       result[row].push(this.getMetadata(key, mId));
       
       // Add any padding columns needed by the column group type
-      for (var k = 0; k < this.validType(type).stride + dateStride - 1; k++) {
+      for (var k = 0; k < this.columnWidth(key) - 1; k++) {
         result[row].push("");
       }
     }
@@ -668,7 +688,7 @@ Timeseries.prototype.writeHeaders = function() {
       result[row].push(this.getKeyPart(key, kId));
             
       // Add any padding columns needed by the column group type
-      for (var k = 0; k < this.validType(type).stride + dateStride - 1; k++) {
+      for (var k = 0; k < this.columnWidth(key) - 1; k++) {
         result[row].push("");
       }
     }
@@ -679,22 +699,17 @@ Timeseries.prototype.writeHeaders = function() {
  
 /** Deserialize the column group data from the supplied headers. */
 Timeseries.prototype.columnGroupsFromHeaders = function(headers) {
-  var columns = {};
+  this.columns = {};
   
   var metadataKeys = Object.keys(this.metadata);
   var keyParts = Object.keys(this.keyspec);
-  if (headers.length < metadataKeys.length + keyParts.length + 1) {
+  if (headers.length < metadataKeys.length + keyParts.length + DEFAULT_HEADERS_LENGTH) {
     throw new Error("Too few header rows["+headers.length+"] for the specified metadata and keys.");
   }
-  
-  var dateOffset = 0;
-  if (this.datespec == "ROW") {
-    dateOffset = 1;
-  }
-  
-  for (var i = dateOffset; i < headers[TYPE_ROW].length;) {
+
+  for (var i = this.serializedColumnOffset(); i < headers[TYPE_ROW].length;) {
     var column = {};
-    var valuesIdx = i - dateOffset;
+    var valuesIdx = i - this.serializedColumnOffset();
     
     if (headers[TYPE_ROW][i] == "") {
       i++;
@@ -714,19 +729,14 @@ Timeseries.prototype.columnGroupsFromHeaders = function(headers) {
     var compositeKey = [];
     for (var j = 0; j < keyParts.length; j++) {
       var keyPart = keyParts[j];
-      var keyPartRow = this.keyspec[keyPart] + metadataKeys.length + 1;
+      var keyPartRow = this.keyspec[keyPart] + metadataKeys.length + DEFAULT_HEADERS_LENGTH;
       compositeKey.push(headers[keyPartRow][i]);
     }
-    columns[this.keyOf(compositeKey)] = column;
+    var key = this.keyOf(compositeKey);
+    this.columns[key] = column;
     
-    i = i + this.validType(column.type).stride;
-    
-    if (this.datespec == "COLUMN") {
-      i++;
-    }
+    i = i + this.columnWidth(key);
   }
-  
-  this.columns = columns;
 }
 
 /** Find the first date in a set of values. 
@@ -735,21 +745,10 @@ Timeseries.prototype.columnGroupsFromHeaders = function(headers) {
 Timeseries.prototype.startDateFromValues = function(values) {
   var result;
   
-  if (this.datespec == "ROW") {
-    if (values.length > 0 && values[0].length > 0) {
-      result = new Date(values[0][0]);
-    }
-  } else {
-    for (var i = 0; i < values.length; i++) {
-      if (values[i].length > 0) {
-        var value = new Date(values[i][0]);
-        if (result === undefined || result > value) {
-          result = value;
-        }
-      } 
-    }
+  if (values.length > 0 && values[0].length > 0) {
+    result = new Date(values[0][0]);
   }
-  
-  this.start_date = result;
+
+  return result;
 }
 
